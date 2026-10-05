@@ -1,0 +1,1137 @@
+import os
+import asyncio
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
+
+import discord
+from discord.ext import commands
+from dotenv import load_dotenv
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+load_dotenv()
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+PREFIX = "x"
+
+# Anti-nuke limits
+CHANNEL_DELETE_LIMIT = 3
+ROLE_DELETE_LIMIT = 3
+CHANNEL_CREATE_LIMIT = 5
+ROLE_CREATE_LIMIT = 5
+
+# Mass moderation limits
+BAN_LIMIT = 3
+KICK_LIMIT = 3
+
+# Time window for anti-nuke / mass moderation
+ACTION_WINDOW = 10
+
+# Anti-raid settings
+RAID_JOIN_LIMIT = 8
+RAID_TIME_WINDOW = 10
+RAID_MODE_DURATION = 60
+
+# How long to remember whitelist entries
+# (Whitelist itself is permanent until removed)
+
+
+# ============================================================
+# INTENTS
+# ============================================================
+
+intents = discord.Intents.default()
+
+intents.guilds = True
+intents.members = True
+intents.message_content = True
+
+
+bot = commands.Bot(
+    command_prefix=PREFIX,
+    intents=intents,
+    help_command=None
+)
+
+
+# ============================================================
+# DATA STORAGE
+# ============================================================
+
+# {
+#   guild_id: {
+#       user_id,
+#   }
+# }
+whitelist = defaultdict(set)
+
+# Security log channel
+log_channels = {}
+
+# Enabled / disabled security systems
+security_enabled = defaultdict(lambda: True)
+
+# Raid mode
+raid_mode = {}
+
+# Recent joins
+recent_joins = defaultdict(deque)
+
+# Action tracking
+action_tracker = defaultdict(lambda: defaultdict(deque))
+
+
+# ============================================================
+# TIME HELPERS
+# ============================================================
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def cleanup_actions(queue, seconds):
+    current = now()
+
+    while queue:
+        if (current - queue[0]).total_seconds() > seconds:
+            queue.popleft()
+        else:
+            break
+
+
+def record_action(guild_id, user_id, action):
+    key = (guild_id, user_id, action)
+
+    queue = action_tracker[key]
+
+    cleanup_actions(queue, ACTION_WINDOW)
+
+    queue.append(now())
+
+    return len(queue)
+
+
+def record_join(guild_id):
+    queue = recent_joins[guild_id]
+
+    cleanup_actions(queue, RAID_TIME_WINDOW)
+
+    queue.append(now())
+
+    return len(queue)
+
+
+# ============================================================
+# WHITELIST
+# ============================================================
+
+def is_whitelisted(guild, user_id):
+
+    # Server owner is ALWAYS trusted
+    if guild.owner_id == user_id:
+        return True
+
+    return user_id in whitelist[guild.id]
+
+
+# ============================================================
+# SECURITY LOGGING
+# ============================================================
+
+async def security_log(guild, title, description, color=discord.Color.red()):
+
+    channel_id = log_channels.get(guild.id)
+
+    if not channel_id:
+        return
+
+    channel = guild.get_channel(channel_id)
+
+    if not channel:
+        return
+
+    embed = discord.Embed(
+        title=f"🛡️ {title}",
+        description=description,
+        color=color,
+        timestamp=now()
+    )
+
+    try:
+        await channel.send(embed=embed)
+    except discord.Forbidden:
+        print(
+            f"[ERROR] Cannot send security logs in {guild.name}"
+        )
+    except Exception as e:
+        print(f"[ERROR] Logging failed: {e}")
+
+
+# ============================================================
+# FIND AUDIT LOG EXECUTOR
+# ============================================================
+
+async def get_audit_executor(
+    guild,
+    action,
+    target_id=None
+):
+
+    try:
+
+        async for entry in guild.audit_logs(
+            limit=10,
+            action=action
+        ):
+
+            # Ignore old audit entries
+            if entry.created_at < now() - timedelta(seconds=10):
+                continue
+
+            if target_id is not None:
+
+                if not entry.target:
+                    continue
+
+                if getattr(entry.target, "id", None) != target_id:
+                    continue
+
+            return entry.user
+
+    except discord.Forbidden:
+
+        await security_log(
+            guild,
+            "Missing Permission",
+            "I cannot read the server Audit Log.",
+            discord.Color.orange()
+        )
+
+    except Exception as e:
+
+        print(f"[Audit Log Error] {e}")
+
+    return None
+
+
+# ============================================================
+# PUNISH USER
+# ============================================================
+
+async def punish_user(
+    guild,
+    user_id,
+    reason,
+    ban=True
+):
+
+    member = guild.get_member(user_id)
+
+    if not member:
+        return False
+
+    # Never punish owner
+    if member.id == guild.owner_id:
+        return False
+
+    # Never punish whitelist
+    if is_whitelisted(guild, member.id):
+        return False
+
+    try:
+
+        if ban:
+
+            await member.ban(
+                reason=f"Anti-Nuke: {reason}",
+                delete_message_seconds=0
+            )
+
+            await security_log(
+                guild,
+                "🚨 USER BANNED",
+                f"**User:** {member.mention}\n"
+                f"**Reason:** {reason}",
+                discord.Color.red()
+            )
+
+        else:
+
+            await member.kick(
+                reason=f"Anti-Nuke: {reason}"
+            )
+
+            await security_log(
+                guild,
+                "⚠️ USER KICKED",
+                f"**User:** {member.mention}\n"
+                f"**Reason:** {reason}",
+                discord.Color.orange()
+            )
+
+        return True
+
+    except discord.Forbidden:
+
+        await security_log(
+            guild,
+            "Permission Error",
+            f"I couldn't punish **{member}**.\n"
+            "Make sure my role is above their role.",
+            discord.Color.orange()
+        )
+
+    except Exception as e:
+
+        print(f"[Punishment Error] {e}")
+
+    return False
+
+
+# ============================================================
+# READY
+# ============================================================
+
+@bot.event
+async def on_ready():
+
+    print("=" * 50)
+    print(f"Logged in as: {bot.user}")
+    print(f"Bot ID: {bot.user.id}")
+    print(f"Servers: {len(bot.guilds)}")
+    print("Security System: ONLINE")
+    print("=" * 50)
+
+    await bot.change_presence(
+        activity=discord.Game(
+            name=f"{PREFIX}security"
+        )
+    )
+
+
+# ============================================================
+# ANTI-BOT ADD
+# ============================================================
+
+@bot.event
+async def on_member_join(member):
+
+    guild = member.guild
+
+    # Track joins for Anti-Raid
+    join_count = record_join(guild.id)
+
+    # --------------------------------------------------------
+    # RAID DETECTION
+    # --------------------------------------------------------
+
+    if join_count >= RAID_JOIN_LIMIT:
+
+        if not raid_mode.get(guild.id, False):
+
+            raid_mode[guild.id] = True
+
+            await security_log(
+                guild,
+                "🚨 RAID DETECTED",
+                f"**{join_count} members** joined within "
+                f"{RAID_TIME_WINDOW} seconds.\n\n"
+                f"Raid mode enabled for "
+                f"{RAID_MODE_DURATION} seconds.",
+                discord.Color.dark_red()
+            )
+
+            asyncio.create_task(
+                disable_raid_mode_later(guild)
+            )
+
+    # --------------------------------------------------------
+    # BOT DETECTION
+    # --------------------------------------------------------
+
+    if member.bot:
+
+        await asyncio.sleep(1)
+
+        executor = await get_audit_executor(
+            guild,
+            discord.AuditLogAction.bot_add,
+            member.id
+        )
+
+        if executor:
+
+            if not is_whitelisted(
+                guild,
+                executor.id
+            ):
+
+                await security_log(
+                    guild,
+                    "🤖 UNAUTHORIZED BOT",
+                    f"**Bot:** {member.mention}\n"
+                    f"**Added by:** {executor.mention}",
+                    discord.Color.red()
+                )
+
+                # Remove unauthorized bot
+                try:
+
+                    await member.kick(
+                        reason="Unauthorized bot added"
+                    )
+
+                except discord.Forbidden:
+                    pass
+
+                # Punish person who added it
+                await punish_user(
+                    guild,
+                    executor.id,
+                    "Unauthorized bot added"
+                )
+
+        return
+
+    # --------------------------------------------------------
+    # RAID MODE
+    # --------------------------------------------------------
+
+    if raid_mode.get(guild.id, False):
+
+        if not is_whitelisted(
+            guild,
+            member.id
+        ):
+
+            try:
+
+                await member.kick(
+                    reason="Anti-Raid: raid mode active"
+                )
+
+                await security_log(
+                    guild,
+                    "🚨 RAID MEMBER REMOVED",
+                    f"Removed **{member}** while raid mode was active.",
+                    discord.Color.dark_red()
+                )
+
+            except discord.Forbidden:
+                pass
+
+
+# ============================================================
+# RAID MODE TIMER
+# ============================================================
+
+async def disable_raid_mode_later(guild):
+
+    await asyncio.sleep(RAID_MODE_DURATION)
+
+    raid_mode[guild.id] = False
+
+    recent_joins[guild.id].clear()
+
+    await security_log(
+        guild,
+        "✅ RAID MODE DISABLED",
+        "Raid mode has automatically ended.",
+        discord.Color.green()
+    )
+
+
+# ============================================================
+# CHANNEL DELETE
+# ============================================================
+
+@bot.event
+async def on_guild_channel_delete(channel):
+
+    guild = channel.guild
+
+    await asyncio.sleep(1)
+
+    executor = await get_audit_executor(
+        guild,
+        discord.AuditLogAction.channel_delete,
+        channel.id
+    )
+
+    if not executor:
+        return
+
+    if is_whitelisted(
+        guild,
+        executor.id
+    ):
+        return
+
+    count = record_action(
+        guild.id,
+        executor.id,
+        "channel_delete"
+    )
+
+    await security_log(
+        guild,
+        "🗑️ CHANNEL DELETED",
+        f"**Channel:** `{channel.name}`\n"
+        f"**Executor:** {executor.mention}\n"
+        f"**Count:** `{count}/{CHANNEL_DELETE_LIMIT}`",
+        discord.Color.orange()
+    )
+
+    if count >= CHANNEL_DELETE_LIMIT:
+
+        await punish_user(
+            guild,
+            executor.id,
+            "Mass channel deletion"
+        )
+
+
+# ============================================================
+# CHANNEL CREATE
+# ============================================================
+
+@bot.event
+async def on_guild_channel_create(channel):
+
+    guild = channel.guild
+
+    await asyncio.sleep(1)
+
+    executor = await get_audit_executor(
+        guild,
+        discord.AuditLogAction.channel_create,
+        channel.id
+    )
+
+    if not executor:
+        return
+
+    if is_whitelisted(
+        guild,
+        executor.id
+    ):
+        return
+
+    count = record_action(
+        guild.id,
+        executor.id,
+        "channel_create"
+    )
+
+    await security_log(
+        guild,
+        "📁 CHANNEL CREATED",
+        f"**Channel:** `{channel.name}`\n"
+        f"**Executor:** {executor.mention}\n"
+        f"**Count:** `{count}/{CHANNEL_CREATE_LIMIT}`",
+        discord.Color.orange()
+    )
+
+    if count >= CHANNEL_CREATE_LIMIT:
+
+        await punish_user(
+            guild,
+            executor.id,
+            "Mass channel creation"
+        )
+
+
+# ============================================================
+# ROLE DELETE
+# ============================================================
+
+@bot.event
+async def on_guild_role_delete(role):
+
+    guild = role.guild
+
+    await asyncio.sleep(1)
+
+    executor = await get_audit_executor(
+        guild,
+        discord.AuditLogAction.role_delete,
+        role.id
+    )
+
+    if not executor:
+        return
+
+    if is_whitelisted(
+        guild,
+        executor.id
+    ):
+        return
+
+    count = record_action(
+        guild.id,
+        executor.id,
+        "role_delete"
+    )
+
+    await security_log(
+        guild,
+        "🎭 ROLE DELETED",
+        f"**Role:** `{role.name}`\n"
+        f"**Executor:** {executor.mention}\n"
+        f"**Count:** `{count}/{ROLE_DELETE_LIMIT}`",
+        discord.Color.orange()
+    )
+
+    if count >= ROLE_DELETE_LIMIT:
+
+        await punish_user(
+            guild,
+            executor.id,
+            "Mass role deletion"
+        )
+
+
+# ============================================================
+# ROLE CREATE
+# ============================================================
+
+@bot.event
+async def on_guild_role_create(role):
+
+    guild = role.guild
+
+    await asyncio.sleep(1)
+
+    executor = await get_audit_executor(
+        guild,
+        discord.AuditLogAction.role_create,
+        role.id
+    )
+
+    if not executor:
+        return
+
+    if is_whitelisted(
+        guild,
+        executor.id
+    ):
+        return
+
+    count = record_action(
+        guild.id,
+        executor.id,
+        "role_create"
+    )
+
+    await security_log(
+        guild,
+        "🎭 ROLE CREATED",
+        f"**Role:** `{role.name}`\n"
+        f"**Executor:** {executor.mention}\n"
+        f"**Count:** `{count}/{ROLE_CREATE_LIMIT}`",
+        discord.Color.orange()
+    )
+
+    if count >= ROLE_CREATE_LIMIT:
+
+        await punish_user(
+            guild,
+            executor.id,
+            "Mass role creation"
+        )
+
+
+# ============================================================
+# MASS BAN
+# ============================================================
+
+@bot.event
+async def on_member_ban(guild, user):
+
+    await asyncio.sleep(1)
+
+    executor = await get_audit_executor(
+        guild,
+        discord.AuditLogAction.ban,
+        user.id
+    )
+
+    if not executor:
+        return
+
+    if is_whitelisted(
+        guild,
+        executor.id
+    ):
+        return
+
+    count = record_action(
+        guild.id,
+        executor.id,
+        "ban"
+    )
+
+    await security_log(
+        guild,
+        "🔨 MEMBER BANNED",
+        f"**User:** `{user}`\n"
+        f"**Executor:** {executor.mention}\n"
+        f"**Count:** `{count}/{BAN_LIMIT}`",
+        discord.Color.orange()
+    )
+
+    if count >= BAN_LIMIT:
+
+        await punish_user(
+            guild,
+            executor.id,
+            "Mass member banning"
+        )
+
+
+# ============================================================
+# MASS KICK
+# ============================================================
+
+@bot.event
+async def on_member_remove(member):
+
+    guild = member.guild
+
+    await asyncio.sleep(1)
+
+    executor = await get_audit_executor(
+        guild,
+        discord.AuditLogAction.kick,
+        member.id
+    )
+
+    if not executor:
+        return
+
+    if is_whitelisted(
+        guild,
+        executor.id
+    ):
+        return
+
+    count = record_action(
+        guild.id,
+        executor.id,
+        "kick"
+    )
+
+    await security_log(
+        guild,
+        "👢 MEMBER KICKED",
+        f"**User:** `{member}`\n"
+        f"**Executor:** {executor.mention}\n"
+        f"**Count:** `{count}/{KICK_LIMIT}`",
+        discord.Color.orange()
+    )
+
+    if count >= KICK_LIMIT:
+
+        await punish_user(
+            guild,
+            executor.id,
+            "Mass member kicking"
+        )
+
+
+# ============================================================
+# SECURITY COMMAND GROUP
+# ============================================================
+
+@bot.group(
+    name="security",
+    invoke_without_command=True
+)
+@commands.has_permissions(administrator=True)
+async def security(ctx):
+
+    guild = ctx.guild
+
+    embed = discord.Embed(
+        title="🛡️ Security System",
+        description="Available security commands:",
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+        name="📊 Status",
+        value=f"`{PREFIX}security status`",
+        inline=False
+    )
+
+    embed.add_field(
+        name="✅ Whitelist",
+        value=(
+            f"`{PREFIX}security whitelist add @user`\n"
+            f"`{PREFIX}security whitelist remove @user`\n"
+            f"`{PREFIX}security whitelist list`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📜 Logging",
+        value=f"`{PREFIX}security logs #channel`",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🚨 Raid",
+        value=(
+            f"`{PREFIX}security raid on`\n"
+            f"`{PREFIX}security raid off`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚙️ System",
+        value=(
+            f"`{PREFIX}security enable`\n"
+            f"`{PREFIX}security disable`"
+        ),
+        inline=False
+    )
+
+    await ctx.send(embed=embed)
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+@security.command()
+@commands.has_permissions(administrator=True)
+async def status(ctx):
+
+    guild = ctx.guild
+
+    embed = discord.Embed(
+        title="🛡️ Security Status",
+        color=discord.Color.green()
+    )
+
+    embed.add_field(
+        name="Anti-Nuke",
+        value="🟢 ENABLED",
+        inline=True
+    )
+
+    embed.add_field(
+        name="Anti-Bot",
+        value="🟢 ENABLED",
+        inline=True
+    )
+
+    embed.add_field(
+        name="Anti-Raid",
+        value=(
+            "🔴 RAID MODE"
+            if raid_mode.get(guild.id, False)
+            else "🟢 MONITORING"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="Whitelisted Users",
+        value=str(len(whitelist[guild.id])),
+        inline=True
+    )
+
+    log_channel_id = log_channels.get(guild.id)
+
+    if log_channel_id:
+
+        channel = guild.get_channel(
+            log_channel_id
+        )
+
+        log_name = channel.mention if channel else "Invalid channel"
+
+    else:
+
+        log_name = "Not configured"
+
+    embed.add_field(
+        name="Log Channel",
+        value=log_name,
+        inline=True
+    )
+
+    await ctx.send(embed=embed)
+
+
+# ============================================================
+# WHITELIST ADD
+# ============================================================
+
+@security.group(
+    name="whitelist",
+    invoke_without_command=True
+)
+@commands.has_permissions(administrator=True)
+async def whitelist_command(ctx):
+
+    await ctx.send(
+        f"Use `{PREFIX}security whitelist add @user`, "
+        f"`remove @user`, or `list`."
+    )
+
+
+@whitelist_command.command(name="add")
+@commands.has_permissions(administrator=True)
+async def whitelist_add(ctx, member: discord.Member):
+
+    whitelist[ctx.guild.id].add(member.id)
+
+    await security_log(
+        ctx.guild,
+        "✅ USER WHITELISTED",
+        f"{member.mention} was added to the security whitelist.",
+        discord.Color.green()
+    )
+
+    await ctx.send(
+        f"✅ {member.mention} has been whitelisted."
+    )
+
+
+# ============================================================
+# WHITELIST REMOVE
+# ============================================================
+
+@whitelist_command.command(name="remove")
+@commands.has_permissions(administrator=True)
+async def whitelist_remove(ctx, member: discord.Member):
+
+    whitelist[ctx.guild.id].discard(member.id)
+
+    await ctx.send(
+        f"✅ {member.mention} was removed from the whitelist."
+    )
+
+
+# ============================================================
+# WHITELIST LIST
+# ============================================================
+
+@whitelist_command.command(name="list")
+@commands.has_permissions(administrator=True)
+async def whitelist_list(ctx):
+
+    users = whitelist[ctx.guild.id]
+
+    if not users:
+
+        await ctx.send(
+            "✅ The whitelist is empty."
+        )
+
+        return
+
+    members = []
+
+    for user_id in users:
+
+        member = ctx.guild.get_member(user_id)
+
+        if member:
+            members.append(
+                f"• {member.mention} (`{member.id}`)"
+            )
+
+    if not members:
+
+        await ctx.send(
+            "The whitelist contains no current members."
+        )
+
+        return
+
+    await ctx.send(
+        "### 🛡️ Whitelisted Users\n" +
+        "\n".join(members)
+    )
+
+
+# ============================================================
+# LOG CHANNEL
+# ============================================================
+
+@security.command()
+@commands.has_permissions(administrator=True)
+async def logs(ctx, channel: discord.TextChannel):
+
+    log_channels[ctx.guild.id] = channel.id
+
+    await ctx.send(
+        f"📜 Security logs will now be sent to {channel.mention}."
+    )
+
+    await security_log(
+        ctx.guild,
+        "📜 LOGGING ENABLED",
+        f"Security logs configured for {channel.mention}.",
+        discord.Color.green()
+    )
+
+
+# ============================================================
+# RAID ON
+# ============================================================
+
+@security.command()
+@commands.has_permissions(administrator=True)
+async def raid(ctx, state=None):
+
+    if state is None:
+
+        current = raid_mode.get(
+            ctx.guild.id,
+            False
+        )
+
+        await ctx.send(
+            f"🚨 Raid mode is currently "
+            f"`{'ON' if current else 'OFF'}`."
+        )
+
+        return
+
+    state = state.lower()
+
+    if state == "on":
+
+        raid_mode[ctx.guild.id] = True
+
+        await security_log(
+            ctx.guild,
+            "🚨 RAID MODE ENABLED",
+            f"Raid mode manually enabled by {ctx.author.mention}.",
+            discord.Color.dark_red()
+        )
+
+        await ctx.send(
+            "🚨 **Raid mode enabled.**"
+        )
+
+    elif state == "off":
+
+        raid_mode[ctx.guild.id] = False
+
+        await security_log(
+            ctx.guild,
+            "✅ RAID MODE DISABLED",
+            f"Raid mode manually disabled by {ctx.author.mention}.",
+            discord.Color.green()
+        )
+
+        await ctx.send(
+            "✅ **Raid mode disabled.**"
+        )
+
+    else:
+
+        await ctx.send(
+            f"Use `{PREFIX}security raid on` "
+            f"or `{PREFIX}security raid off`."
+        )
+
+
+# ============================================================
+# ENABLE / DISABLE
+# ============================================================
+
+@security.command()
+@commands.has_permissions(administrator=True)
+async def enable(ctx):
+
+    security_enabled[ctx.guild.id] = True
+
+    await ctx.send(
+        "🟢 Security systems enabled."
+    )
+
+
+@security.command()
+@commands.has_permissions(administrator=True)
+async def disable(ctx):
+
+    security_enabled[ctx.guild.id] = False
+
+    await ctx.send(
+        "🔴 Security systems disabled."
+    )
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+@bot.event
+async def on_command_error(ctx, error):
+
+    if isinstance(
+        error,
+        commands.MissingPermissions
+    ):
+
+        await ctx.send(
+            "❌ You need administrator permission."
+        )
+
+    elif isinstance(
+        error,
+        commands.MissingRequiredArgument
+    ):
+
+        await ctx.send(
+            "❌ You're missing an argument."
+        )
+
+    elif isinstance(
+        error,
+        commands.MemberNotFound
+    ):
+
+        await ctx.send(
+            "❌ I couldn't find that member."
+        )
+
+    elif isinstance(
+        error,
+        commands.CommandNotFound
+    ):
+
+        return
+
+    else:
+
+        print(
+            f"[Command Error] {error}"
+        )
+
+
+# ============================================================
+# START BOT
+# ============================================================
+
+if not TOKEN:
+
+    print(
+        "ERROR: DISCORD_TOKEN was not found in .env"
+    )
+
+else:
+
+    bot.run(TOKEN)
